@@ -35,6 +35,25 @@ go build -o gopf .
 
 `SIGUSR1` 会记录 goroutine 数量和堆栈；`SIGINT` 或 `SIGTERM` 退出进程。
 
+### 同一监听地址，修改目标
+
+将 `listen1 → target1` 改为 `listen1 → target2`，发送 `SIGHUP` 且 reload 成功后：
+
+- `listen1` 继续监听，已有转发连接继续使用 `target1`，直到连接断开。
+- 新接入的 TCP 连接转发到 `target2`。
+- HTTP Keep-Alive 等长连接上的后续请求仍走 `target1`，重新建连后才走 `target2`。
+
+如果 `target2` 连不上，新连接会关闭；已有的 `target1` 转发连接不受影响。
+
+### 保持目标，更换监听地址
+
+将 `listen1 → target1` 改为 `listen2 → target1` 后发送 `SIGHUP`。程序先绑定 `listen2`，成功后再停止 `listen1` 的监听：
+
+- 新连接通过 `listen2` 转发到 `target1`，`listen1` 不再接收新连接。
+- 已通过 `listen1` 建立的转发连接继续使用 `target1`，直到连接断开。
+
+如果 `listen2` 被占用或与现有监听地址冲突，reload 失败，`listen1` 保持原样。
+
 ## 基准测试
 
 基准测试只依赖 Go，在仓库根目录执行：
