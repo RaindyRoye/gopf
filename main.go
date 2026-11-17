@@ -1,6 +1,4 @@
-// Package main implements a simple TCP load balancer/proxy.
-// It listens on a local address, reads backend configuration from a JSON file,
-// and forwards incoming connections to selected backend hosts based on weighted round-robin.
+// Package main forwards TCP connections to a configured target.
 package main
 
 import (
@@ -10,34 +8,26 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"math/rand"
 	"net"
 	"os"
 	"os/signal"
 	"runtime"
+	"strconv"
 	"sync"
 	"syscall"
 	"time"
 )
 
-// Host represents a single backend server.
-type Host struct {
-	Addr   string `json:"addr"`   // Address of the backend server (e.g., "192.168.1.10:8080")
-	Weight int    `json:"weight"` // Weight for load balancing (higher weight means more traffic)
+// Config identifies the fixed forwarding target.
+type Config struct {
+	Target string `json:"target"`
 }
 
-// Backend holds the configuration for all backend servers.
-type Backend struct {
-	TrafficUrl string `json:"traffic_url"` // Not used in this proxy implementation
-	Hosts      []Host `json:"hosts"`       // List of backend hosts
-	weightSum  int    // Pre-calculated sum of all host weights for efficient selection
-}
-
-// Options holds the application's runtime configuration.
+// Options holds the configuration used by new connections.
 type Options struct {
-	configFile string       // Path to the JSON configuration file
-	backend    Backend      // Current backend configuration
-	mutex      sync.RWMutex // Protects concurrent access to 'backend'
+	configFile string
+	config     Config
+	mutex      sync.RWMutex
 }
 
 var options Options
@@ -49,79 +39,50 @@ func usage() {
 	os.Exit(1)
 }
 
-// reloadConfig loads the backend configuration from the specified JSON file.
-// It updates the global 'options.backend' atomically using a mutex.
-func reloadConfig(configPath string) error {
+func readConfig(configPath string) (Config, error) {
 	file, err := os.Open(configPath)
 	if err != nil {
-		return fmt.Errorf("failed to open config file '%s': %w", configPath, err)
+		return Config{}, fmt.Errorf("open config %q: %w", configPath, err)
 	}
 	defer file.Close()
 
-	var newBackend Backend
+	var config Config
 	decoder := json.NewDecoder(file)
-	if err := decoder.Decode(&newBackend); err != nil {
-		return fmt.Errorf("failed to parse config file '%s': %w", configPath, err)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&config); err != nil {
+		return Config{}, fmt.Errorf("parse config %q: %w", configPath, err)
 	}
-
-	// Calculate the total weight for the new configuration.
-	weightSum := 0
-	for i := range newBackend.Hosts {
-		host := &newBackend.Hosts[i]
-		// Validate host address format
-		if _, _, err := net.SplitHostPort(host.Addr); err != nil {
-			return fmt.Errorf("invalid host address '%s' in config: %w", host.Addr, err)
-		}
-		// Ensure weight is positive (or zero for disabled host)
-		if host.Weight < 0 {
-			return fmt.Errorf("invalid negative weight %d for host '%s'", host.Weight, host.Addr)
-		}
-		weightSum += host.Weight
+	if err := decoder.Decode(new(any)); err != io.EOF {
+		return Config{}, fmt.Errorf("config %q must contain one JSON object", configPath)
 	}
-	newBackend.weightSum = weightSum
+	host, port, err := net.SplitHostPort(config.Target)
+	if err != nil || host == "" {
+		return Config{}, fmt.Errorf("invalid target %q: expected host:port", config.Target)
+	}
+	number, err := strconv.Atoi(port)
+	if err != nil || number < 1 || number > 65535 {
+		return Config{}, fmt.Errorf("invalid target port %q", port)
+	}
+	return config, nil
+}
 
-	log.Printf("Loaded new config: %+v", newBackend)
-
-	// Atomically update the global backend configuration.
+// reloadConfig publishes the target only after the new configuration is valid.
+func reloadConfig(configPath string) error {
+	config, err := readConfig(configPath)
+	if err != nil {
+		return err
+	}
 	options.mutex.Lock()
-	options.backend = newBackend
+	options.config = config
 	options.mutex.Unlock()
-
+	log.Printf("Loaded target: %s", config.Target)
 	return nil
 }
 
-// getBackend retrieves a copy of the current backend configuration.
-// It uses a read lock to allow concurrent access.
-func getBackend() Backend {
+func getTarget() string {
 	options.mutex.RLock()
 	defer options.mutex.RUnlock()
-	return options.backend
-}
-
-// chooseHost selects a backend host based on weighted random selection.
-// It uses the provided Backend struct which contains pre-calculated weightSum.
-func chooseHost(backend Backend) *Host {
-	if backend.weightSum <= 0 {
-		return nil // No valid hosts
-	}
-
-	// Generate a random value within the total weight range.
-	randomValue := rand.Intn(backend.weightSum)
-
-	// Iterate through hosts and select based on cumulative weight.
-	cumulativeWeight := 0
-	for _, host := range backend.Hosts {
-		cumulativeWeight += host.Weight
-		if randomValue < cumulativeWeight {
-			return &host // Found the selected host
-		}
-	}
-	// Fallback: This should theoretically not happen if weightSum calculation is correct,
-	// but return the last host if it does.
-	if len(backend.Hosts) > 0 {
-		return &backend.Hosts[len(backend.Hosts)-1]
-	}
-	return nil
+	return options.config.Target
 }
 
 // forward copies data bidirectionally between two TCP connections.
@@ -155,35 +116,18 @@ func forward(conn1, conn2 *net.TCPConn) {
 	wg.Wait()
 }
 
-// handleConn manages the lifecycle of a single incoming connection.
-// It selects a backend host, connects to it, and starts bidirectional forwarding.
+// handleConn captures the current target before forwarding the connection.
 func handleConn(clientConn *net.TCPConn) {
-	defer clientConn.Close() // Ensure the client connection is closed when this function exits.
-
-	// Get the current backend configuration.
-	backend := getBackend()
-
-	// Select a backend host based on weights.
-	host := chooseHost(backend)
-	if host == nil {
-		log.Println("No available backend hosts to forward connection.")
-		return
-	}
-
-	// Dial the selected backend host.
+	defer clientConn.Close()
+	target := getTarget()
 	dialer := net.Dialer{Timeout: 5 * time.Second, KeepAlive: 60 * time.Second}
-	backendConn, err := dialer.Dial("tcp", host.Addr)
+	backendConn, err := dialer.Dial("tcp", target)
 	if err != nil {
-		log.Printf("Failed to connect to backend '%s': %v", host.Addr, err)
+		log.Printf("Failed to connect to target %q: %v", target, err)
 		return
 	}
-	defer backendConn.Close() // Ensure the backend connection is closed.
-
-	// Keep the TCP connection type for half-close support.
-	backendTCPConn := backendConn.(*net.TCPConn)
-
-	// Start bidirectional forwarding between client and backend.
-	forward(clientConn, backendTCPConn)
+	defer backendConn.Close()
+	forward(clientConn, backendConn.(*net.TCPConn))
 }
 
 // Constants for custom signals (platform-dependent, consider using SIGHUP/SIGUSR1/USR2)
@@ -245,7 +189,7 @@ func main() {
 		log.Fatalf("Failed to create listener on '%s': %v", *listenAddr, err)
 	}
 	defer listener.Close()
-	log.Printf("Load balancer started, listening on %s", *listenAddr)
+	log.Printf("TCP forwarder started, listening on %s", *listenAddr)
 
 	// Set up signal handling
 	go func() {
