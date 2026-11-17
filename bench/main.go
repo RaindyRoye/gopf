@@ -59,7 +59,7 @@ func run(ctx context.Context, requests, concurrency int, keepAlive bool) error {
 	}
 	defer backend.Close()
 
-	config := fmt.Sprintf(`{"hosts":[{"addr":%q,"weight":1}]}`, backendAddress)
+	config := fmt.Sprintf(`{"target":%q}`, backendAddress)
 	configPath := filepath.Join(dir, "settings.json")
 	if err := os.WriteFile(configPath, []byte(config), 0o600); err != nil {
 		return err
@@ -82,7 +82,7 @@ func run(ctx context.Context, requests, concurrency int, keepAlive bool) error {
 			line := scanner.Text()
 			fmt.Fprintln(os.Stderr, line)
 			// Wait for this process to bind, rather than probing another listener.
-			if strings.Contains(line, "Load balancer started, listening on ") {
+			if strings.Contains(line, "TCP forwarder started, listening on ") {
 				ready <- struct{}{}
 			}
 		}
