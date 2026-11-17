@@ -59,12 +59,12 @@ func run(ctx context.Context, requests, concurrency int, keepAlive bool) error {
 	}
 	defer backend.Close()
 
-	config := fmt.Sprintf(`{"target":%q}`, backendAddress)
+	config := fmt.Sprintf(`{"forwards":[{"listen":%q,"target":%q}]}`, proxyAddress, backendAddress)
 	configPath := filepath.Join(dir, "settings.json")
 	if err := os.WriteFile(configPath, []byte(config), 0o600); err != nil {
 		return err
 	}
-	proxy := exec.Command(binary, "-listen", proxyAddress, configPath)
+	proxy := exec.Command(binary, configPath)
 	proxy.Stdout = os.Stderr
 	stderr, err := proxy.StderrPipe()
 	if err != nil {
@@ -82,7 +82,7 @@ func run(ctx context.Context, requests, concurrency int, keepAlive bool) error {
 			line := scanner.Text()
 			fmt.Fprintln(os.Stderr, line)
 			// Wait for this process to bind, rather than probing another listener.
-			if strings.Contains(line, "TCP forwarder started, listening on ") {
+			if strings.Contains(line, "Forwarding "+proxyAddress+" -> ") {
 				ready <- struct{}{}
 			}
 		}
