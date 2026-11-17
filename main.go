@@ -4,6 +4,7 @@
 package main
 
 import (
+        "context"
         "encoding/json"
         "flag"
         "fmt"
@@ -128,7 +129,7 @@ func chooseHost(backend Backend) *Host {
 func forward(conn1, conn2 *net.TCPConn) {
         // Use a WaitGroup to wait for both directions to finish copying.
         var wg sync.WaitGroup
-        wg.Add(2)
+        wg.Add(1)
 
         // Copy from conn1 to conn2
         go func() {
@@ -143,18 +144,12 @@ func forward(conn1, conn2 *net.TCPConn) {
                 }
         }()
 
-        // Copy from conn2 to conn1
-        go func() {
-                defer wg.Done()
-                // Close the read side of conn1 when copying from conn2 finishes.
-                defer conn1.CloseRead()
-                // Copy data from conn2's reader to conn1's writer.
-                _, err := io.Copy(conn1, conn2)
-                if err != nil && err != io.EOF {
-                        // Log errors during copy, but EOF is normal when one side closes.
-                        log.Printf("Forwarding error (conn2->conn1): %v", err)
-                }
-        }()
+        // Reuse the handler goroutine for the reverse direction.
+        _, err := io.Copy(conn1, conn2)
+        conn1.CloseRead()
+        if err != nil && err != io.EOF {
+                log.Printf("Forwarding error (conn2->conn1): %v", err)
+        }
 
         // Wait for both copy operations to complete.
         wg.Wait()
@@ -176,21 +171,16 @@ func handleConn(clientConn *net.TCPConn) {
         }
 
         // Dial the selected backend host.
-        backendConn, err := net.DialTimeout("tcp", host.Addr, 5*time.Second) // Add a dial timeout
+        dialer := net.Dialer{Timeout: 5 * time.Second, KeepAlive: 60 * time.Second}
+        backendConn, err := dialer.Dial("tcp", host.Addr)
         if err != nil {
                 log.Printf("Failed to connect to backend '%s': %v", host.Addr, err)
                 return
         }
         defer backendConn.Close() // Ensure the backend connection is closed.
 
-        // Assert types for TCP-specific operations (SetKeepAlive, CloseRead/CloseWrite).
+        // Keep the TCP connection type for half-close support.
         backendTCPConn := backendConn.(*net.TCPConn)
-
-        // Configure keep-alive for both connections to maintain long-lived sessions.
-        clientConn.SetKeepAlive(true)
-        clientConn.SetKeepAlivePeriod(60 * time.Second)
-        backendTCPConn.SetKeepAlive(true)
-        backendTCPConn.SetKeepAlivePeriod(60 * time.Second)
 
         // Start bidirectional forwarding between client and backend.
         forward(clientConn, backendTCPConn)
@@ -249,7 +239,8 @@ func main() {
         }
 
         // Create the TCP listener
-        listener, err := net.Listen("tcp", *listenAddr)
+        listenConfig := net.ListenConfig{KeepAlive: 60 * time.Second}
+        listener, err := listenConfig.Listen(context.Background(), "tcp", *listenAddr)
         if err != nil {
                 log.Fatalf("Failed to create listener on '%s': %v", *listenAddr, err)
         }
@@ -298,7 +289,6 @@ func main() {
 
                 // Cast to *net.TCPConn for further processing (forwarding, keepalive).
                 tcpConn := conn.(*net.TCPConn)
-                log.Printf("Accepted connection from %s", tcpConn.RemoteAddr())
 
                 // Handle the connection in a new goroutine.
                 go handleConn(tcpConn)

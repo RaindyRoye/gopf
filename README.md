@@ -1,68 +1,59 @@
-## make
-go install gopf
+# gopf
 
-## benchmark
-* use nginx as backend
-* export GOMAXPROCS=1 && go install gopf && bin/gopf settings.conf
+gopf 是一个简单的 TCP 转发代理。它为每个进入的连接按权重随机选择一个后端，然后双向转发字节流；它不解析 HTTP，也不会在后端连接失败时自动重试。
 
-* use gopf as proxy: ab -n 10000 -c 100 http://127.0.0.1:1248/
-```
-Server Software:        nginx/1.2.1
-Server Hostname:        127.0.0.1
-Server Port:            1248
+## 构建和运行
 
-Document Path:          /
-Document Length:        396 bytes
+需要 Go 1.25.6 或更新版本。程序使用 Unix 信号，适用于 macOS 和 Linux。
 
-Concurrency Level:      100
-Time taken for tests:   0.816 seconds
-Complete requests:      10000
-Failed requests:        0
-Write errors:           0
-Total transferred:      6060000 bytes
-HTML transferred:       3960000 bytes
-Requests per second:    12256.13 [#/sec] (mean)
-Time per request:       8.159 [ms] (mean)
-Time per request:       0.082 [ms] (mean, across all concurrent requests)
-Transfer rate:          7253.14 [Kbytes/sec] received
-
-Connection Times (ms)
-              min  mean[+/-sd] median   max
-Connect:        0    0   0.4      0       4
-Processing:     3    8   1.3      8      18
-Waiting:        2    6   1.4      6      14
-Total:          3    8   1.4      8      18
+```sh
+go build -o gopf .
+./gopf -listen 127.0.0.1:1248 settings.conf
 ```
 
-* connnect nginx direct: ab -n 10000 -c 100 http://127.0.0.1/
-```
-Server Software:        nginx/1.2.1
-Server Hostname:        127.0.0.1
-Server Port:            80
+启动前，确保配置中的后端已经监听。仓库里的 `settings.conf` 默认指向 `127.0.0.1:80`；可按需要修改：
 
-Document Path:          /
-Document Length:        396 bytes
-
-Concurrency Level:      100
-Time taken for tests:   0.477 seconds
-Complete requests:      10000
-Failed requests:        0
-Write errors:           0
-Total transferred:      6060000 bytes
-HTML transferred:       3960000 bytes
-Requests per second:    20945.74 [#/sec] (mean)
-Time per request:       4.774 [ms] (mean)
-Time per request:       0.048 [ms] (mean, across all concurrent requests)
-Transfer rate:          12395.62 [Kbytes/sec] received
-
-Connection Times (ms)
-              min  mean[+/-sd] median   max
-Connect:        1    2   0.3      2       4
-Processing:     1    3   0.5      2       8
-Waiting:        1    2   0.5      2       5
-Total:          3    5   0.5      5      11
-WARNING: The median and mean for the processing time are not within a normal deviation
-        These results are probably not that reliable.
+```json
+{
+  "hosts": [
+    { "addr": "127.0.0.1:8080", "weight": 100 },
+    { "addr": "127.0.0.1:8081", "weight": 50 }
+  ]
+}
 ```
 
-* much faster than pen(http://siag.nu/pen/)
+权重为 0 的后端不会被选择，负数无效。没有可用权重或无法连接选中的后端时，代理会关闭该客户端连接。修改配置后向进程发送 `SIGHUP` 可重新加载；`SIGUSR1` 会记录 goroutine 数量和堆栈。
+
+## 基准测试
+
+基准测试只依赖 Go，在仓库根目录执行：
+
+```sh
+go run ./bench
+```
+
+运行器自动构建 gopf，启动返回固定 396 字节内容的本地 HTTP 后端，并生成临时代理配置。随后用内置 Go 压测器分别直连后端、经过代理，各跑一次。结束、失败或按 Ctrl+C 时自动清理自己启动的进程和临时文件。
+
+默认每条路径发送 10,000 个请求，并发 100，每个请求新建连接。只有三个参数：
+
+| 参数 | 含义 | 默认值 |
+| --- | --- | --- |
+| `-n` | 每条路径的请求总数 | `10000` |
+| `-c` | 并发数 | `100` |
+| `-k` | 使用 HTTP Keep-Alive | `false` |
+
+```sh
+go run ./bench -n 20000 -c 50
+go run ./bench -k
+go run ./bench -h
+```
+
+每条路径输出成功/失败请求数、并发数、总耗时、QPS，以及成功请求的平均、P50、P99 延迟。QPS = 成功请求数 / 总耗时；每个请求最多等待 5 秒，非 2xx 响应或建连、读写失败计入失败。出现请求失败时仍显示两条路径的结果，最后以非零状态退出。
+
+想再观察一次就重新运行；需要保存输出时可重定向到文件：
+
+```sh
+go run ./bench > bench.txt 2>&1
+```
+
+后端固定监听 `127.0.0.1:18080`，代理固定监听 `127.0.0.1:1248`；端口已被占用时直接报错。运行器继承 `GOMAXPROCS`，需要固定 Go 并行度时可执行 `GOMAXPROCS=1 go run ./bench`。
