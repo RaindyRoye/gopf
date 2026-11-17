@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -177,6 +178,50 @@ func TestReadConfigRejectsInvalidRules(t *testing.T) {
 			if _, err := readConfig(path); err == nil {
 				t.Fatal("invalid config was accepted")
 			}
+		})
+	}
+}
+
+type acceptErrorOnceListener struct {
+	net.Listener
+	err error
+}
+
+func (listener *acceptErrorOnceListener) Accept() (net.Conn, error) {
+	if listener.err != nil {
+		err := listener.err
+		listener.err = nil
+		return nil, err
+	}
+	return listener.Listener.Accept()
+}
+
+func TestAcceptRecoversFromRetryableErrors(t *testing.T) {
+	for _, errno := range []syscall.Errno{syscall.EMFILE, syscall.ENFILE, syscall.ETIMEDOUT} {
+		t.Run(errno.Error(), func(t *testing.T) {
+			listener, err := net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			entry := &portForwarder{listener: &acceptErrorOnceListener{
+				Listener: listener,
+				err:      &net.OpError{Op: "accept", Err: os.NewSyscallError("accept", errno)},
+			}}
+			entry.target.Store(responseBackend(t, "ok"))
+			done := make(chan struct{})
+			go func() {
+				entry.serve()
+				close(done)
+			}()
+			t.Cleanup(func() {
+				listener.Close()
+				select {
+				case <-done:
+				case <-time.After(2 * time.Second):
+					t.Error("accept loop did not exit after listener closed")
+				}
+			})
+			requireResponse(t, forwardingClient(t, false), listener.Addr().String(), "ok")
 		})
 	}
 }

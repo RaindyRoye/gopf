@@ -11,6 +11,7 @@ import (
 	"os"
 	"strconv"
 	"sync/atomic"
+	"syscall"
 	"time"
 )
 
@@ -139,7 +140,8 @@ func (entry *portForwarder) serve() {
 				return
 			}
 			log.Printf("Accept error on %s: %v", entry.listener.Addr(), err)
-			if netErr, ok := err.(net.Error); ok && netErr.Temporary() {
+			if errors.Is(err, syscall.EMFILE) || errors.Is(err, syscall.ENFILE) || errors.Is(err, syscall.ETIMEDOUT) {
+				time.Sleep(100 * time.Millisecond)
 				continue
 			}
 			return
