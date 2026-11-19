@@ -21,7 +21,7 @@ const (
 )
 
 // forward copies data bidirectionally between two TCP connections.
-// It closes the read side of one connection and the write side of the other upon completion.
+// Each copy closes its destination's write side so the other direction can finish independently.
 func forward(conn1, conn2 *net.TCPConn) {
 	// Use a WaitGroup to wait for both directions to finish copying.
 	var wg sync.WaitGroup
@@ -42,7 +42,7 @@ func forward(conn1, conn2 *net.TCPConn) {
 
 	// Reuse the handler goroutine for the reverse direction.
 	_, err := io.Copy(conn1, conn2)
-	conn1.CloseRead()
+	conn1.CloseWrite()
 	if err != nil && err != io.EOF {
 		log.Printf("Forwarding error (conn2->conn1): %v", err)
 	}
